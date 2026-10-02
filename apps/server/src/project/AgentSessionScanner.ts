@@ -1,4 +1,3 @@
-// @effect-diagnostics nodeBuiltinImport:off - Effect's FileSystem drops NTFS file IDs above Number.MAX_SAFE_INTEGER; the raw bigint stat preserves them.
 /**
  * AgentSessionScanner - discovery of projects a user already works on.
  *
@@ -14,6 +13,7 @@
  *
  * @module project/AgentSessionScanner
  */
+// @effect-diagnostics-next-line nodeBuiltinImport:off - Effect's FileSystem drops NTFS file IDs above Number.MAX_SAFE_INTEGER; the raw bigint stat preserves them.
 import * as NodeFS from "node:fs/promises";
 import * as NodeOS from "node:os";
 
@@ -589,7 +589,8 @@ function extractCwd(line: string): string | null {
   return null;
 }
 
-function transcriptIdentity(
+/** @public Pure helper exported for regression tests; identity construction stays beside its comparison. */
+export function transcriptIdentity(
   filePath: string,
   stats: FileSystem.File.Info,
   inodeRaw: string | null,
@@ -614,9 +615,21 @@ function normalizeInodeRaw(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-function sameTranscriptIdentity(
-  left: ReturnType<typeof transcriptIdentity> | AgentSessionImportSource,
-  right: ReturnType<typeof transcriptIdentity> | AgentSessionImportSource,
+/** Minimal shape compared by {@link sameTranscriptIdentity}. */
+interface TranscriptIdentityLike {
+  readonly filePath: string;
+  readonly size: number;
+  readonly mtimeMs: number | null;
+  readonly device: number;
+  readonly inode: number | null;
+  readonly inodeRaw?: unknown;
+  readonly birthtimeMs: number | null;
+}
+
+/** @public Pure helper exported for regression tests; the Windows collision is decided here. */
+export function sameTranscriptIdentity(
+  left: TranscriptIdentityLike,
+  right: TranscriptIdentityLike,
 ): boolean {
   if (
     left.filePath !== right.filePath ||
@@ -631,8 +644,8 @@ function sameTranscriptIdentity(
   // Records written before the raw ID existed have no `inodeRaw`; fall back
   // to the numeric check above so they don't re-import. When both sides
   // carry a raw ID (the Windows case where `inode` is `null`), it must match.
-  const leftRaw = normalizeInodeRaw((left as { readonly inodeRaw?: unknown }).inodeRaw);
-  const rightRaw = normalizeInodeRaw((right as { readonly inodeRaw?: unknown }).inodeRaw);
+  const leftRaw = normalizeInodeRaw(left.inodeRaw);
+  const rightRaw = normalizeInodeRaw(right.inodeRaw);
   if (leftRaw !== null && rightRaw !== null && leftRaw !== rightRaw) {
     return false;
   }
