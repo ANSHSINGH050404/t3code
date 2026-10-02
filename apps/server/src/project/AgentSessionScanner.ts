@@ -589,7 +589,14 @@ function extractCwd(line: string): string | null {
   return null;
 }
 
-/** @public Pure helper exported for regression tests; identity construction stays beside its comparison. */
+/**
+ * File identity snapshot for one transcript path.
+ *
+ * `inodeRaw` carries the decimal `ino` so NTFS file IDs above
+ * `Number.MAX_SAFE_INTEGER` survive; it is `null` when the raw stat failed.
+ *
+ * @public Pure helper exported for regression tests; identity construction stays beside its comparison.
+ */
 export function transcriptIdentity(
   filePath: string,
   stats: FileSystem.File.Info,
@@ -611,6 +618,11 @@ export function transcriptIdentity(
   };
 }
 
+/**
+ * Normalizes a stored or freshly read raw inode to a comparable string.
+ * Anything that is not a non-empty string (missing field on pre-fix records,
+ * failed stat) becomes `null` and falls back to the numeric check.
+ */
 function normalizeInodeRaw(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
@@ -626,7 +638,15 @@ interface TranscriptIdentityLike {
   readonly birthtimeMs: number | null;
 }
 
-/** @public Pure helper exported for regression tests; the Windows collision is decided here. */
+/**
+ * Whether two identity snapshots describe the same file.
+ *
+ * Records written before the raw ID existed have no `inodeRaw`; they fall
+ * back to the numeric check so they are not re-imported. When both sides
+ * carry a raw ID (the Windows case where `inode` is `null`), it must match.
+ *
+ * @public Pure helper exported for regression tests; the Windows collision is decided here.
+ */
 export function sameTranscriptIdentity(
   left: TranscriptIdentityLike,
   right: TranscriptIdentityLike,
@@ -652,12 +672,7 @@ export function sameTranscriptIdentity(
   return true;
 }
 
-/**
- * Decimal `ino` for `transcriptIdentity`, preserving NTFS file IDs above
- * `Number.MAX_SAFE_INTEGER` where Effect's `ino` is `None`. Returns the safe
- * integer as a string without extra I/O; otherwise stats the path with
- * bigint enabled. `null` when the file is gone or the ID is unavailable.
- */
+/** Tagged failure for the raw bigint stat in {@link readRawInode}. */
 class TranscriptInodeStatError extends Schema.TaggedError<TranscriptInodeStatError>()(
   "TranscriptInodeStatError",
   {
@@ -666,6 +681,18 @@ class TranscriptInodeStatError extends Schema.TaggedError<TranscriptInodeStatErr
   },
 ) {}
 
+/**
+ * Decimal `ino` for `transcriptIdentity`, preserving NTFS file IDs above
+ * `Number.MAX_SAFE_INTEGER` where Effect's `ino` is `None`. Returns the safe
+ * integer as a string without extra I/O; otherwise stats the path with
+ * bigint enabled. `null` when the file is gone or the ID is unavailable.
+ *
+ * The raw stat is path-based while surrounding reads use the opened handle,
+ * so a replacement racing between the two can only mix metadata from one file
+ * with the raw ID of another. A mixed identity mismatches (a raw ID names
+ * exactly one file), so the outcome is always the safe direction — skip or
+ * re-read — never a false match.
+ */
 const readRawInode = (
   filePath: string,
   knownIno: Option.Option<number>,
@@ -726,6 +753,11 @@ export const make = Effect.gen(function* () {
   const statOption = (target: string) =>
     fileSystem.stat(target).pipe(Effect.asSome, Effect.orElseSucceed(Option.none));
 
+  /**
+   * Builds a transcript identity snapshot, filling `inodeRaw` from the safe
+   * numeric inode when available and from a raw bigint stat otherwise, so
+   * large NTFS file IDs survive on Windows without extra I/O on other systems.
+   */
   const transcriptIdentityEffect = Effect.fn("AgentSessionScanner.transcriptIdentity")(function* (
     filePath: string,
     stats: FileSystem.File.Info,
