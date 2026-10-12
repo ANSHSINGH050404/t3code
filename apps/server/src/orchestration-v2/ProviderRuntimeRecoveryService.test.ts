@@ -21,7 +21,7 @@ import * as Ref from "effect/Ref";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
-import * as IdAllocator from "./IdAllocator.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -578,6 +578,71 @@ it.effect("cancels a stale waiting run when no checkpoint capture can finish it"
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("closes a secret request card's form when its run is recovered", () => {
+  const threadId = ThreadId.make("thread_secret_recovery");
+  const runId = RunId.make("run_secret_recovery");
+  let committedInput: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0] | null =
+    null;
+  const projection = {
+    thread: { id: threadId },
+    runtimeRequests: [],
+    providerSessions: [],
+    providerThreads: [],
+    providerTurns: [],
+    runs: [{ id: runId, status: "running", providerInstanceId: ProviderInstanceId.make("codex") }],
+    attempts: [],
+    nodes: [],
+    subagents: [],
+    messages: [],
+    turnItems: [
+      {
+        id: "turn-item:secret-request:recovery",
+        threadId,
+        runId,
+        nodeId: null,
+        type: "secret_request",
+        status: "waiting",
+        secretStatus: "pending",
+        label: "GitHub token",
+        reason: "Used as GH_TOKEN.",
+      },
+    ],
+  } as unknown as OrchestrationV2ThreadProjection;
+  const layer = ProviderRuntimeRecovery.layer.pipe(
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getRecoveryThreadIds: () => Effect.succeed([threadId]),
+          getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+        }),
+        Layer.mock(EventSink.EventSinkV2)({
+          commitCommand: (input) => {
+            committedInput = input;
+            return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);
+          },
+        }),
+        IdAllocator.layer,
+        Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({
+          runRecoveryOnce: Effect.succeed(false),
+        }),
+        Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listByCommandId: () => Effect.succeed([]),
+          reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+        }),
+      ),
+    ),
+  );
+
+  return Effect.gen(function* () {
+    yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).reconcile("startup");
+    const itemEvent = committedInput?.events.find((event) => event.type === "turn-item.updated");
+    const card = itemEvent?.type === "turn-item.updated" ? itemEvent.payload : null;
+    assert.equal(card?.status, "cancelled");
+    assert.equal(card?.type === "secret_request" ? card.secretStatus : null, "cancelled");
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("holds accepted queued work without cancelling its execution state after restart", () => {
   const threadId = ThreadId.make("thread_queued_restart");
   const runId = RunId.make("run_queued_restart");
@@ -788,6 +853,97 @@ it.effect(
     }).pipe(Effect.provide(layer));
   },
 );
+
+it.effect("cancels workflow members and child roots without run ids after restart", () => {
+  const parentThreadId = ThreadId.make("thread_recovery_workflow_members");
+  const childThreadId = ThreadId.make("thread_recovery_workflow_member_child");
+  const memberId = NodeId.make("node_recovery_workflow_member");
+  const childRootId = NodeId.make("node_recovery_workflow_member_root");
+  const providerInstanceId = ProviderInstanceId.make("claudeAgent");
+  const driver = ProviderDriverKind.make("claudeAgent");
+  const member = {
+    id: memberId,
+    threadId: parentThreadId,
+    runId: null,
+    origin: "provider_native",
+    status: "running",
+    driver,
+    providerInstanceId,
+  };
+  const parentProjection = {
+    thread: { id: parentThreadId, providerInstanceId },
+    runs: [],
+    attempts: [],
+    nodes: [
+      { id: memberId, threadId: parentThreadId, runId: null, kind: "subagent", status: "running" },
+    ],
+    subagents: [member],
+    runtimeRequests: [],
+    providerSessions: [],
+    providerThreads: [],
+    providerTurns: [],
+    messages: [],
+    turnItems: [],
+  } as unknown as OrchestrationV2ThreadProjection;
+  const childProjection = {
+    ...parentProjection,
+    thread: { id: childThreadId, providerInstanceId },
+    nodes: [
+      {
+        id: childRootId,
+        threadId: childThreadId,
+        runId: null,
+        kind: "root_turn",
+        status: "running",
+      },
+    ],
+    subagents: [],
+  } as unknown as OrchestrationV2ThreadProjection;
+  const committed: Array<Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0]> = [];
+  const layer = ProviderRuntimeRecovery.layer.pipe(
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getRecoveryThreadIds: () => Effect.succeed([parentThreadId, childThreadId]),
+          getRuntimeRecoveryProjection: (threadId) =>
+            Effect.succeed(threadId === parentThreadId ? parentProjection : childProjection),
+        }),
+        Layer.mock(EventSink.EventSinkV2)({
+          commitCommand: (input) => {
+            committed.push(input);
+            return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);
+          },
+        }),
+        IdAllocator.layer,
+        Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({
+          runRecoveryOnce: Effect.succeed(false),
+        }),
+        Layer.mock(EffectOutbox.EffectOutboxV2)({
+          reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+        }),
+      ),
+    ),
+  );
+
+  return Effect.gen(function* () {
+    yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).reconcile("startup");
+    assert.deepEqual(
+      committed.flatMap((command) =>
+        command.events.map((event) => [
+          command.threadId,
+          event.type,
+          "status" in event.payload ? event.payload.status : null,
+        ]),
+      ),
+      [
+        [parentThreadId, "subagent.updated", "cancelled"],
+        [parentThreadId, "node.updated", "cancelled"],
+        [childThreadId, "node.updated", "cancelled"],
+      ],
+    );
+  }).pipe(Effect.provide(layer));
+});
 
 it.effect(
   "clears persisted pendingBackgroundTasks and terminalizes stale background items on settled runs",
@@ -1162,6 +1318,7 @@ it.effect(
         {
           id: staleSubagentNodeId,
           runId: settledRunId,
+          origin: "provider_native",
           driver: ProviderDriverKind.make("claude"),
           providerInstanceId: claudeInstanceId,
           status: "running",
@@ -1170,6 +1327,7 @@ it.effect(
           // Already finished with a real result: must never be overwritten.
           id: doneSubagentNodeId,
           runId: settledRunId,
+          origin: "provider_native",
           driver: ProviderDriverKind.make("claude"),
           providerInstanceId: claudeInstanceId,
           status: "completed",
@@ -1272,3 +1430,151 @@ it.effect(
     }).pipe(Effect.provide(layer));
   },
 );
+
+it.effect("leaves delegated tasks to their own child threads after process loss", () => {
+  const threadId = ThreadId.make("thread_recovery_delegation");
+  const settledRunId = RunId.make("run_recovery_delegation_settled");
+  const runningRunId = RunId.make("run_recovery_delegation_running");
+  const providerThreadId = ProviderThreadId.make("provider_thread_recovery_delegation");
+  const claudeInstanceId = ProviderInstanceId.make("claude");
+  const driver = ProviderDriverKind.make("claude");
+  const settledTaskId = NodeId.make("node_recovery_delegation_settled");
+  const runningTaskId = NodeId.make("node_recovery_delegation_running");
+  const nativeSubagentId = NodeId.make("node_recovery_native_subagent");
+  const delegatedTask = (id: NodeId, runId: RunId) => ({
+    id,
+    runId,
+    origin: "app_owned",
+    childThreadId: ThreadId.make(`thread:delegated-task:${id}`),
+    driver,
+    providerInstanceId: claudeInstanceId,
+    status: "running",
+  });
+  const subagentItem = (subagentId: NodeId, runId: RunId, origin: string) => ({
+    id: TurnItemId.make(`turn_item:${subagentId}`),
+    runId,
+    nodeId: subagentId,
+    providerThreadId,
+    type: "subagent",
+    status: "running",
+    subagentId,
+    origin,
+    childThreadId:
+      origin === "app_owned" ? ThreadId.make(`thread:delegated-task:${subagentId}`) : null,
+    providerInstanceId: claudeInstanceId,
+    title: `subagent ${subagentId}`,
+  });
+  let committedInput: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0] | null =
+    null;
+  const projection = {
+    thread: { id: threadId, providerInstanceId: claudeInstanceId },
+    runtimeRequests: [],
+    providerSessions: [],
+    providerThreads: [
+      {
+        id: providerThreadId,
+        driver,
+        providerInstanceId: claudeInstanceId,
+        ownerNodeId: null,
+        status: "idle",
+        pendingBackgroundTasks: [],
+      },
+    ],
+    providerTurns: [],
+    runs: [
+      {
+        id: settledRunId,
+        ordinal: 1,
+        status: "completed",
+        providerThreadId,
+        providerInstanceId: claudeInstanceId,
+      },
+      {
+        id: runningRunId,
+        ordinal: 2,
+        status: "running",
+        providerThreadId,
+        providerInstanceId: claudeInstanceId,
+      },
+    ],
+    attempts: [],
+    nodes: [
+      { id: settledTaskId, runId: settledRunId, status: "running", kind: "subagent" },
+      { id: runningTaskId, runId: runningRunId, status: "running", kind: "subagent" },
+      { id: nativeSubagentId, runId: settledRunId, status: "running", kind: "subagent" },
+    ],
+    subagents: [
+      delegatedTask(settledTaskId, settledRunId),
+      delegatedTask(runningTaskId, runningRunId),
+      {
+        ...delegatedTask(nativeSubagentId, settledRunId),
+        origin: "provider_native",
+        childThreadId: null,
+      },
+    ],
+    messages: [],
+    turnItems: [
+      subagentItem(settledTaskId, settledRunId, "app_owned"),
+      subagentItem(runningTaskId, runningRunId, "app_owned"),
+      subagentItem(nativeSubagentId, settledRunId, "provider_native"),
+    ],
+  } as unknown as OrchestrationV2ThreadProjection;
+  const layer = ProviderRuntimeRecovery.layer.pipe(
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getRecoveryThreadIds: () => Effect.succeed([threadId]),
+          getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+        }),
+        Layer.mock(EventSink.EventSinkV2)({
+          commitCommand: (input) => {
+            committedInput = input;
+            return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);
+          },
+        }),
+        IdAllocator.layer,
+        Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({
+          runRecoveryOnce: Effect.succeed(false),
+        }),
+        Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listByCommandId: () => Effect.succeed([]),
+          reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+        }),
+      ),
+    ),
+  );
+
+  return Effect.gen(function* () {
+    yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).reconcile("startup");
+    const events = committedInput?.events ?? [];
+    const touched = events.flatMap((event) =>
+      event.type === "turn-item.updated"
+        ? event.payload.type === "subagent"
+          ? [event.payload.subagentId]
+          : []
+        : event.type === "subagent.updated" || event.type === "node.updated"
+          ? [event.payload.id]
+          : [],
+    );
+    // The cut run itself is cancelled; only the provider-native subagent dies with it.
+    assert.isTrue(
+      events.some(
+        (event) =>
+          event.type === "run.updated" &&
+          event.payload.id === runningRunId &&
+          event.payload.status === "cancelled",
+      ),
+    );
+    assert.notInclude(touched, settledTaskId);
+    assert.notInclude(touched, runningTaskId);
+    assert.include(touched, nativeSubagentId);
+    // The note lists only provider-native work: delegated tasks report back on their own.
+    const noted = events.flatMap((event) =>
+      event.type === "run.background-work-cancelled"
+        ? event.payload.restartCancelledBackgroundWork.map((work) => work.label)
+        : [],
+    );
+    assert.deepEqual(noted, [`subagent ${nativeSubagentId}`]);
+  }).pipe(Effect.provide(layer));
+});

@@ -1,6 +1,6 @@
 import { ComposerContextId } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult } from "effect/reactivity";
 import { useNavigation } from "@react-navigation/native";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert } from "react-native";
@@ -238,7 +238,8 @@ export function ComposerEditor({
               threadId: String(thread.threadId),
             });
           }}
-          environmentId={environmentId}
+          environmentId={environmentId ?? draft.project?.environmentId}
+          projectId={draft.project?.projectId}
           records={draft.context?.records}
           attachments={draft.attachments}
           onClose={() => setSelected(null)}

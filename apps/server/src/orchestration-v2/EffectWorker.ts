@@ -78,7 +78,7 @@ export class OrchestrationEffectExecutorV2 extends Context.Service<
   OrchestrationEffectExecutorV2Shape
 >()("t3/orchestration-v2/EffectWorker/OrchestrationEffectExecutorV2") {}
 
-export const executorLayer: Layer.Layer<
+export const layerExecutor: Layer.Layer<
   OrchestrationEffectExecutorV2,
   never,
   | ProviderSessionManager.ProviderSessionManagerV2
@@ -108,13 +108,17 @@ export const executorLayer: Layer.Layer<
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
-          case "provider-runtime.continue":
-            return continueRestartedRun({
-              threadId: effect.threadId,
-              sourceRunId: effect.request.sourceRunId,
-            }).pipe(
+          case "provider-runtime.continue": {
+            const sourceRunId = effect.request.sourceRunId;
+            return continueRestartedRun({ threadId: effect.threadId, sourceRunId }).pipe(
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.provideService(ServerSettings.ServerSettingsService, settings),
+              // A continuation that will never run still owes a delegated parent a result.
+              Effect.tapError(() =>
+                willRetry
+                  ? Effect.void
+                  : threads.recoverDelegatedTask(effect.threadId, sourceRunId),
+              ),
               Effect.mapError(
                 (cause) =>
                   new OrchestrationEffectExecutionError({
@@ -124,6 +128,7 @@ export const executorLayer: Layer.Layer<
                   }),
               ),
             );
+          }
           case "provider-session.detach":
             return providerSessions
               .detach({
@@ -164,19 +169,34 @@ export const executorLayer: Layer.Layer<
                 providerSessionId: effect.request.providerSessionId,
                 providerThreadId: effect.request.providerThreadId,
                 providerTurnId: effect.request.providerTurnId,
+                ...(effect.request.subagent === undefined
+                  ? {}
+                  : { subagent: effect.request.subagent }),
               })
               .pipe(
+                Effect.catch((cause) =>
+                  isNonRetryableProviderTurnControlFailure(
+                    effect.request.type,
+                    Cause.pretty(Cause.fail(cause)),
+                  )
+                    ? Effect.void
+                    : Effect.fail(cause),
+                ),
                 // The provider has stopped what it still ran and reported it.
                 // Whatever the thread still shows on that provider thread is
                 // work no process will report on, so the Stop ends it too.
+                // One Stop can interrupt several provider threads, so the
+                // settle is keyed by effect, not by the Stop command.
                 Effect.andThen(
-                  threads.dispatch({
-                    type: "thread.background-work.settle",
-                    commandId: CommandId.make(`${effect.commandId}:background-work-settled`),
-                    threadId: effect.threadId,
-                    providerThreadId: effect.request.providerThreadId,
-                    providerTurnId: effect.request.providerTurnId,
-                  }),
+                  effect.request.subagent !== undefined
+                    ? Effect.void
+                    : threads.dispatch({
+                        type: "thread.background-work.settle",
+                        commandId: CommandId.make(`${effect.id}:background-work-settled`),
+                        threadId: effect.threadId,
+                        providerThreadId: effect.request.providerThreadId,
+                        providerTurnId: effect.request.providerTurnId,
+                      }),
                 ),
                 Effect.mapError(
                   (cause) =>
@@ -236,41 +256,61 @@ export const executorLayer: Layer.Layer<
                     if (message === undefined || run === undefined) return yield* error;
                     // Reuse the message identity and a stable command receipt so an outbox
                     // retry cannot append a duplicate message or start a second follow-up.
-                    yield* threads.dispatch({
-                      type: "message.dispatch",
-                      commandId: CommandId.make(`command:steer-follow-up:${effect.id}`),
-                      threadId: effect.threadId,
-                      messageId: message.id,
-                      text: message.text,
-                      ...(message.context ? { context: message.context } : {}),
-                      attachments: message.attachments,
-                      // A user's follow-up starts on the thread's saved selection,
-                      // which already holds the steer's choice. A delegated
-                      // completion stays pinned to the run it reports to.
-                      ...(message.delegatedCompletion === undefined
-                        ? {}
-                        : { modelSelection: run.modelSelection }),
-                      dispatchMode: {
-                        type:
-                          message.delegatedCompletion === undefined
-                            ? "start_immediately"
-                            : "queue_after_active",
-                      },
-                      createdBy: message.createdBy,
-                      creationSource: message.creationSource,
-                      ...(message.delegatedCompletion === undefined
-                        ? {}
-                        : { delegatedCompletion: message.delegatedCompletion }),
-                      ...(message.notification === undefined
-                        ? {}
-                        : { notification: message.notification }),
-                      ...(message.scheduledTaskId === undefined
-                        ? {}
-                        : { scheduledTaskId: message.scheduledTaskId }),
-                      ...(message.senderThreadId === undefined
-                        ? {}
-                        : { senderThreadId: message.senderThreadId }),
-                    });
+                    yield* threads
+                      .dispatch({
+                        type: "message.dispatch",
+                        commandId: CommandId.make(`command:steer-follow-up:${effect.id}`),
+                        threadId: effect.threadId,
+                        messageId: message.id,
+                        text: message.text,
+                        ...(message.context ? { context: message.context } : {}),
+                        attachments: message.attachments,
+                        // A user's follow-up starts on the thread's saved selection,
+                        // which already holds the steer's choice. A delegated
+                        // completion stays pinned to the run it reports to.
+                        ...(message.delegatedCompletion === undefined
+                          ? {}
+                          : { modelSelection: run.modelSelection }),
+                        dispatchMode: {
+                          type:
+                            message.delegatedCompletion === undefined
+                              ? "start_immediately"
+                              : "queue_after_active",
+                        },
+                        createdBy: message.createdBy,
+                        creationSource: message.creationSource,
+                        ...(message.delegatedCompletion === undefined
+                          ? {}
+                          : { delegatedCompletion: message.delegatedCompletion }),
+                        ...(message.notification === undefined
+                          ? {}
+                          : { notification: message.notification }),
+                        ...(message.scheduledTaskId === undefined
+                          ? {}
+                          : { scheduledTaskId: message.scheduledTaskId }),
+                        ...(message.senderThreadId === undefined
+                          ? {}
+                          : { senderThreadId: message.senderThreadId }),
+                      })
+                      .pipe(
+                        // The turn that just completed leaves no further retry
+                        // target once the instance is off: the completed turn
+                        // stands as the thread's result instead of going
+                        // through the outbox's bounded retry on a refusal that
+                        // retrying cannot change.
+                        Effect.catchTags({
+                          ThreadManagementProviderInstanceDisabledError: (disabledError) =>
+                            Effect.logInfo(
+                              "orchestration-v2.effect-worker.steer-follow-up-disabled",
+                              {
+                                threadId: effect.threadId,
+                                messageId: message.id,
+                                projectId: disabledError.projectId,
+                                instanceId: disabledError.instanceId,
+                              },
+                            ),
+                        }),
+                      );
                   }),
                 ),
                 Effect.mapError(
@@ -424,6 +464,17 @@ export const executorLayer: Layer.Layer<
                   }),
               ),
             );
+          case "preview.cleanup":
+            return resourceCleanup.cleanupPreviews(effect.threadId).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                    cause,
+                  }),
+              ),
+            );
           case "attachment.cleanup":
             return resourceCleanup.cleanupAttachments(effect.request.attachmentIds).pipe(
               Effect.mapError(
@@ -441,6 +492,23 @@ export const executorLayer: Layer.Layer<
                 threadId: effect.threadId,
                 requestId: effect.commandId,
                 kind: effect.request.kind,
+              })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
+          case "delegated-tasks.stop":
+            return threads
+              .stopDelegatedTasks({
+                threadId: effect.threadId,
+                commandId: effect.commandId,
+                reason: effect.request.reason,
               })
               .pipe(
                 Effect.mapError(
@@ -822,6 +890,6 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
 
 export const runDaemon = runDaemonWithOptions();
 
-const daemonLayer: Layer.Layer<never, never, OrchestrationEffectWorkerV2> = Layer.effectDiscard(
+const layerDaemon: Layer.Layer<never, never, OrchestrationEffectWorkerV2> = Layer.effectDiscard(
   runDaemon.pipe(Effect.forkScoped),
 );
